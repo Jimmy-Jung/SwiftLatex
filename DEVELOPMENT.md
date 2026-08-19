@@ -1,0 +1,498 @@
+# SwiftLatex 개발 문서
+
+SwiftUI 기반의 메시지 렌더러다. Markdown, 인라인/블록 LaTeX, 코드 블록을
+네이티브 UI로 표시하는 재사용 가능한 Swift Package를 목표로 한다.
+UIKit 앱은 Apple의 SwiftUI 호스팅 API로 사용한다.
+
+- 작성자: JunyoungJung
+- 최초 작성: 2026-08-19
+- 최종 개정: 2026-08-19 (rev.4)
+- 상태: 구현 전 설계 초안 — P0 검증 후 공개 API 확정
+- 배포 대상 후보: iOS/iPadOS 16 이상
+
+---
+
+## 0. 문서의 결정 수준
+
+### 확인된 사실
+
+- SwiftMath `1.7.2`의 `MathImage.asImage()`는 이미지와
+  `LayoutInfo(ascent:descent:)`를 반환한다. 기존 fork 계획은 필요 없다.
+- `swift-markdown`은 수식 AST 노드를 제공하지 않는다. 수식 구간을 별도로 찾아
+  원문 범위를 보존해야 한다.
+- 검토한 `swift-markdown 0.4.0`의 source column은 UTF-8 byte 기준이다.
+- iOS 16에서 `Text(Image:)`, `Text.baselineOffset(_:)`,
+  `.textSelection(.enabled)`, `UIHostingConfiguration`, `UIHostingController`를 사용할 수 있다.
+- 현재 검증 도구는 Xcode `26.6 (17F113)`이다.
+- 현재 설치된 simulator runtime은 iOS `18.6`, `26.3`, `26.5`이며 iOS 16 runtime은 없다.
+
+최소 toolchain, parser range, baseline/raster preflight, concurrency, iOS 16 runtime,
+스트리밍 기준은 P0에서 결정한다. 그전에는 “설계 확정”, “Xcode 16+ 지원”,
+“임의의 untrusted 입력에 안전”이라고 선언하지 않는다.
+
+---
+
+## 1. v1 목표와 범위
+
+### 목표
+
+LLM 채팅 UI에서 어시스턴트 메시지 하나를 다음처럼 표시한다.
+
+```text
+원의 넓이는 \( A = \pi r^2 \)입니다.
+            ↓
+문장 흐름 안에 baseline 정렬된 수식이 포함된 네이티브 텍스트
+```
+
+### 포함 범위
+
+| 영역 | v1 계약 |
+|---|---|
+| Markdown 블록 | 문단, 헤딩, 순서/비순서 리스트, 인용, 구분선 |
+| 인라인 | 굵게, 기울임, 취소선, 코드, 절대 URL 링크, 줄바꿈 |
+| 수식 | 기본 `\(...\)`, `\[...\]`; opt-in `$...$`, `$$...$$` |
+| 코드 블록 | 언어 라벨, 가로 스크롤, 복사 버튼, plain monospace |
+| 스트리밍 | 최신 전체 `String` 입력, coalescing과 latest-wins 게시 |
+| 선택 | SwiftUI `.textSelection(.enabled)`의 시스템 동작 |
+| UIKit | `UIHostingConfiguration`, `UIHostingController` 사용 예제 |
+| 접근성 | Dynamic Type, VoiceOver, 키보드, 명암/굵은 텍스트 검증 |
+
+### 명시적 비목표
+
+- 공개 parser/AST product
+- 신택스 하이라이팅과 Highlightr 의존성
+- `UITextView`/`NSTextAttachment` 기반의 두 번째 렌더 경로
+- 여러 블록을 가로지르는 연속 범위 선택
+- callback 기반 링크/복사 API
+- 공개 입력 제한 설정
+- 표, 원격 이미지, Mermaid, HTML 실행, WebView, 편집, macOS UI
+- 링크와 이미지 Markdown 문법 내부의 LaTeX 해석
+
+두 번째 실제 소비자나 측정된 요구가 생기기 전에는 위 기능을 추가하지 않는다.
+
+### 실패 시 표시 원칙
+
+- 잘못되거나 미완성인 LaTeX는 원래 구분자를 포함한 source를 표시한다.
+- 미지원 Markdown 노드는 읽을 수 있는 plain text로 낮추며 조용히 삭제하지 않는다.
+- 이미지 문법은 alt text만 표시한다.
+- HTML은 실행하지 않고 문자 그대로 표시한다.
+- 제한을 넘은 입력은 `Character` 경계의 bounded prefix와 명시적 생략 marker로 표시한다.
+
+---
+
+## 2. 최소 공개 표면
+
+v1의 공개 product는 `SwiftLatex` 하나다.
+
+```swift
+import SwiftLatex
+
+LatexMarkdownView(
+    markdown: message,
+    parsesDollarMath: false
+)
+.latexTheme(.default)
+```
+
+- `parsesDollarMath` 기본값은 `false`다.
+- 링크 실행은 allowlist를 통과한 뒤 SwiftUI `OpenURLAction`을 사용한다.
+- 코드 복사는 패키지의 native `Button` 동작으로 제공한다.
+- UIKit 전용 wrapper와 범용 custom renderer API는 만들지 않는다.
+- 내부 parser target은 테스트와 UI target 분리를 위해 두되 외부 product로 노출하지 않는다.
+  UI target이 쓰는 교차 target 심볼은 Swift 5.9의 `package` 접근 수준으로 한정한다.
+
+### 초기 Package.swift 방향
+
+- Swift tools `5.9`, platform `.iOS(.v16)`을 P0 시작점으로 사용한다.
+- 공개 product는 `SwiftLatex` 하나다.
+- 비공개 `SwiftLatexCore` target은 `Markdown` product에 의존한다.
+- UI target은 Core와 SwiftMath에 의존한다.
+- P0 재현성은 SwiftMath `exact: "1.7.2"`, swift-markdown `exact: "0.4.0"`으로 시작한다.
+- 지원 toolchain을 확정한 뒤에만 CI에서 검증한 버전 범위로 넓힌다.
+
+`swift-markdown`을 `from: "0.4.0"`으로 선언하면 SwiftPM이 Swift tools 6.2가 필요한 이후
+0.x 버전을 선택할 수 있으므로 낮은 Xcode 지원 계약과 함께 사용하지 않는다.
+
+---
+
+## 3. 파싱 계약
+
+### 후보 흐름
+
+```text
+원문 UTF-8
+  │
+  ├─ 사전 byte 상한 검사
+  ├─ 1차 swift-markdown 파싱
+  │    ├─ Paragraph 범위 수집
+  │    └─ CodeBlock, InlineCode, HTML, Link/Image 전체 범위를 금지 범위로 수집
+  ├─ 원문 수식 스캔
+  │    └─ 금지 범위를 제외하고 delimiter 후보와 원문 span 저장
+  ├─ 원문과 UTF-8 byte 길이가 같은 수식 보호 버퍼 생성
+  ├─ 2차 swift-markdown 파싱
+  └─ 내부 ParsedDocument 생성
+```
+
+1차 AST는 수식을 찾는 결과가 아니라 코드와 링크 같은 금지 문맥을 찾는 데만 사용한다.
+수식은 원문 전체에서 탐색한다. 그래야 `\(a * b\)`, `\(x_[i]\)`처럼 Markdown 기호가
+포함된 LaTeX를 1차 Markdown 노드 분할과 관계없이 보호할 수 있다.
+
+block 수식은 1차 AST의 paragraph source 전체를 기준으로 판정하고, 나머지 허용 범위에서
+inline 수식을 찾는다. `swift-markdown` 공개 API만으로 link destination의 정확한 내부 범위를
+안정적으로 얻는다는
+가정을 두지 않는다. v1은 단순하고 안전하게 `Link`와 `Image` 전체 source range에서 수식을
+해석하지 않는다.
+
+### 보호 버퍼
+
+각 수식은 다음 정보로 보존한다.
+
+```swift
+struct ProtectedMathSpan {
+    let originalUTF8Range: Range<Int>
+    let kind: MathKind
+    let source: String
+}
+```
+
+- 수식 span의 각 non-newline UTF-8 byte를 ASCII `x` 한 byte로 바꾸는 방식을 P0에서 검증한다.
+- LF/CRLF와 span 밖의 indentation은 그대로 둔다.
+- 보호 버퍼와 원문의 UTF-8 byte 길이를 항상 같게 유지하므로 2차 AST range를 별도
+  offset 변환 없이 원문 range로 사용할 수 있다.
+- placeholder 안의 diagnostic은 해당 원문 수식 span 전체에 연결한다.
+- `restore(protect(source)) == source`를 byte 단위로 보장한다.
+
+다국어 수식 앞뒤의 source range가 그대로 유지되는 property test가 필수다.
+
+### delimiter 규칙
+
+우선순위는 다음과 같다.
+
+```text
+code / HTML / Link / Image 금지 범위
+  > escaped delimiter
+  > \[...\] / \(...\)
+  > opt-in $$...$$ / $...$
+  > plain text
+```
+
+- `\(...\)`는 한 logical line의 inline 수식이다.
+- `\[...\]`와 opt-in `$$...$$`는 공백을 제외한 한 paragraph source 전체가 해당
+  구분자로 감싸진 경우에만 block 수식이다.
+- 미완성·빈 구분자와 중첩 delimiter는 plain text와 내부 diagnostic으로 처리한다.
+- 연속 backslash의 홀짝에 따른 escape 결과를 fixture로 고정한다.
+- Dollar math는 기본 비활성화하고 다음 v1 자체 규칙만 약속한다.
+  - `\$`는 delimiter가 아니다.
+  - 여는 `$` 바로 뒤와 닫는 `$` 바로 앞에 공백이 올 수 없다.
+  - 닫는 `$` 바로 뒤에 숫자가 올 수 없다.
+  - inline `$...$`는 줄바꿈을 넘지 않는다.
+  - `$$`를 `$`보다 먼저 판정한다.
+
+“Pandoc과 완전히 동일”하다고 표현하지 않는다. 구현한 규칙과 fixture가 실제 계약이다.
+
+### 내부 모델
+
+- parser와 AST는 `SwiftLatexCore` target의 package-private 구현 세부사항이다.
+- source span은 원문 UTF-8 offset/length를 저장한다.
+- view identity는 렌더 시점의 위치와 content digest로 만들며 편집 사이의 영속성을
+  약속하지 않는다.
+
+---
+
+## 4. 비동기 렌더 계약
+
+SwiftUI `body`와 `.task`의 MainActor 구간에서 CPU 파싱이나 수식 raster 생성을 직접
+실행하지 않는다.
+`.task`가 `async`라는 사실만으로 background 실행을 보장한다고 가정하지 않는다.
+
+```text
+새 markdown + 환경값
+  │
+  ├─ MainActor: generation 증가, 최신 원문 fallback 즉시 표시
+  ├─ 단일 worker: 실행 중 1개 + 최신 대기 1개만 유지
+  ├─ non-MainActor RenderService: parse
+  ├─ MainActor: generation 일치 시 수식을 원문으로 둔 ParsedDocument 게시
+  ├─ MathRenderService actor: 수식 이미지 준비
+  └─ MainActor: generation 일치 시 hydrated RenderedDocument 게시
+```
+
+- request key에는 source, dollar 옵션, theme, scaled point size, resolved color를 포함한다.
+- 새 요청은 현재 generation을 stale로 표시하고 대기 요청을 최신 값으로 교체한다.
+- 장수명 worker 하나만 요청을 소비한다. 현재 동기 구간이 반환되기 전에는 다음 요청을
+  시작하지 않으며, `.bufferingNewest(1)` 같은 경계로 대기는 하나만 유지한다.
+- 첫 parse 전, service 진입 직후, parse 직후, 각 수식 block 사이에 generation을 확인한다.
+- `swift-markdown` parse와 SwiftMath raster 하나는 동기·비취소 구간일 수 있으므로 입력/수식
+  상한으로 작업량을 제한하고 측정된 최대 실행 시간을 gate로 둔다. 완료 직후에는 오래된
+  generation을 버린다.
+- parse 게시와 최종 게시 직전에 각각 generation을 확인한다.
+- stale이 된 하위 연산이 늦게 끝나도 결과를 UI나 cache에 넣지 않는다.
+- `RenderedDocument`는 게시 후 변경하지 않는 값이다.
+- 수식 렌더 실패 시 해당 노드만 원문 source를 유지한다.
+
+`RenderService`와 `MathRenderService`의 isolation은 P0 spike로 컴파일·실행 검증한다.
+특히 SwiftMath가 반환하는 이미지 타입을 actor 밖으로 보낼 때 비검증
+`@unchecked Sendable`로 경고만 숨기지 않는다. 안전한 immutable bitmap 전달 경로를 확인하지
+못하면 bounded MainActor 렌더나 데이터 변환 경로를 선택한다.
+
+API는 현재 메시지 전체 `String`을 받으며 증분 parser를 제공하지 않는다. 호출자는 token
+이벤트를 최대 약 10Hz로 합쳐 전달한다. P0에서는 50 KiB fixture를 10Hz로 30초 갱신해
+기준 기기/OS/configuration의 baseline, idle 시간, 실행/대기 상한을 정한다. 증분 파싱은
+확정된 성능 기준을 넘은 측정 근거가 있을 때만 검토한다.
+
+---
+
+## 5. 렌더링과 플랫폼 계약
+
+### 인라인 수식
+
+SwiftMath `1.7.2`의 공개 API만 사용한다.
+
+```swift
+import SwiftMath
+import SwiftUI
+
+var mathImage = MathImage(
+    latex: latex,
+    fontSize: scaledFontSize,
+    textColor: resolvedColor,
+    labelMode: .text,
+    textAlignment: .left
+)
+
+let (error, image, layout) = mathImage.asImage()
+
+if error == nil, let image, let layout {
+    Text(Image(uiImage: image))
+        .baselineOffset(-layout.descent)
+} else {
+    Text(source)
+}
+```
+
+`-layout.descent`는 검증할 가설이지 Apple이나 SwiftMath가 보장한 SwiftUI 공식이 아니다.
+분수, 근호, 첨자, 합/적분, 행렬을 한글·영문·이모지 옆에 놓고 모든 Dynamic Type 크기에서
+baseline 오차와 clipping을 측정한다.
+
+### 블록 렌더
+
+| 노드 | 기본 렌더 |
+|---|---|
+| 문단/헤딩 | inline 노드를 합친 `Text` |
+| 리스트/인용 | 재귀 SwiftUI block renderer |
+| block math | 가로 `ScrollView` 안의 수식과 원문 복사 버튼 |
+| code block | 언어/복사 헤더와 가로 `ScrollView`의 monospace `Text` |
+| thematic break | `Divider` |
+
+메시지 전체의 세로 스크롤과 목록 virtualization은 소비 앱 책임이다.
+
+### 접근성
+
+- visual 수식 이미지는 동일한 원문 수식이 accessibility representation에 있을 때 decorative로 둔다.
+- 링크가 있는 문단 전체에 하나의 `.accessibilityLabel`을 덮어써서 개별 link semantics를
+  없애지 않는다.
+- 접근성 표현은 텍스트, 링크, “수식: 원본 LaTeX”를 읽기 순서대로 제공한다.
+- 코드/수식 복사는 native `Button`, 명확한 label/hint, 최소 44×44pt hit target을 사용한다.
+- VoiceOver, Full Keyboard Access, 모든 Dynamic Type 단계, Bold Text,
+  Increase Contrast, light/dark mode를 UI 테스트한다.
+
+### 링크
+
+- 자동 링크로 만드는 scheme은 `https`, `http`, `mailto`만 허용한다.
+- 상대 URL과 다른 scheme은 v1에서 plain text로 표시한다.
+- HTML을 실행하거나 URL로 변환하지 않는다.
+- 허용된 링크는 native `OpenURLAction`을 거치므로 소비 앱의 환경 override를 존중한다.
+
+### UIKit 호스팅
+
+```swift
+cell.contentConfiguration = UIHostingConfiguration {
+    LatexMarkdownView(markdown: message)
+}
+```
+
+`UIHostingConfiguration` 셀은 자체 크기 조정을 지원한다. UICollectionView layout이 고정
+`itemSize`이면 잘릴 수 있으므로 estimated dimension을 사용하고, 비동기 콘텐츠·재사용·회전·
+Dynamic Type 뒤 높이를 UI 테스트한다.
+
+일반 화면은 `UIHostingController`를 사용한다. child containment는 `addChild`, Auto Layout,
+`didMove(toParent:)` 순서를 지킨다. 패키지는 별도 UIKit wrapper를 제공하지 않는다.
+
+---
+
+## 6. 입력 보호와 cache
+
+### 입력 보호
+
+- 원문 UTF-8 byte 상한은 첫 `Document(parsing:)` 전에 검사한다.
+- 초과 시 내부 표시 상한까지 `Character` 경계로 자르고
+  `… [입력 제한 초과]` marker를 붙인다.
+- AST depth/node count는 parse 후 출력 비용을 제한할 뿐 parser DoS의 사전 방어라고
+  주장하지 않는다.
+- 수식 source byte/구문 복잡도는 `MathImage.asImage()` 호출 전에 제한한다.
+- 내부 상한은 P0 adversarial fixture와 측정으로 정하며 v1 공개 API로 고정하지 않는다.
+
+SwiftMath `1.7.2`의 `MathImage.asImage()`는 내부에서 raster 크기를 계산한 뒤 바로
+`UIGraphicsImageRenderer`를 생성한다. 반환 이미지의 dimension을 사후 검사하는 것만으로는
+OOM을 예방할 수 없다. 다음 중 하나를 P0에서 검증하기 전에는 raster dimension 제한을
+보안 경계로 문서화하지 않는다.
+
+1. allocation 전 크기를 얻는 public measure 경로
+2. 실제 최악 입력에서 상한을 증명한 보수적 source/구조/font 제한
+3. SwiftMath upstream의 public preflight API
+
+### 수식 cache
+
+cache key에는 다음 값을 포함한다.
+
+- LaTeX source
+- math font 식별자와 실제 point size
+- resolved RGBA
+- inline/display mode
+- display scale
+
+이미지 pixel byte를 cost로 사용해 `totalCostLimit`과 항목 수를 제한하고 memory warning에서
+비운다. cache의 reference box는 actor 내부 전용 `final` class와 `let` 필드만 사용한다.
+actor 밖에는 P0에서 Sendable 안전성을 확인한 immutable 결과만 반환한다.
+
+---
+
+## 7. 구현 순서와 Definition of Done
+
+### P0 — 기술 spike
+
+- Xcode `26.6 (17F113)`에서 exact SwiftMath `1.7.2`, swift-markdown `0.4.0` 조합 컴파일
+- 지원하려는 최소 Xcode로 같은 consumer build를 실행해 실제 최소 toolchain 확정
+- code/HTML/link 금지 범위와 수식 보호/복원 parser prototype
+- 동일 UTF-8 byte 길이 mask와 다국어 source range property test
+- Markdown 기호를 포함한 LaTeX와 다국어 UTF-8 source range fixture
+- `Text(Image:)` baseline, Dynamic Type, accessibility representation spike
+- SwiftMath raster preflight와 이미지 Sendable/isolation 경로 확정
+- deployment target 16 consumer compile과 현재 최소 runtime(iOS 18.6) 선택/복사 동작 기록
+- iOS 16 실행 지원을 선언하려면 호환 Xcode/runtime 또는 실기기 검증 환경 별도 확보
+- 최소 `Examples/SwiftLatexDemo/SwiftLatexDemo.xcodeproj`, UI-test target,
+  shared scheme/test plan 생성
+- 스트리밍 baseline 측정 환경과 P1 합격 수치 확정
+
+완료 조건: 위 결과와 충돌하는 설계 문구를 수정한 뒤에만 P1 API를 고정한다.
+
+### P1 — 최소 v1 구현
+
+- package-scoped parser/model/diagnostic과 fail-open 정책
+- Markdown 기본 블록/인라인, 수식, plain 코드 블록
+- 2단계 게시와 latest-wins coordinator
+- 수식 cache와 P0에서 확정한 입력/raster 제한
+- system text selection, link allowlist, 접근성 표현
+- SwiftUI 예제와 Foundation Core 테스트
+
+완료 조건:
+
+- Core line coverage 80% 이상
+- parser property/fixture, stale-generation/out-of-order, cache limit 테스트 통과
+- strict concurrency build와 MainActor stall signpost 기준 통과
+- P0에서 확정한 스트리밍 회귀 기준 통과
+- invalid/malformed/제한 초과 fixture가 정의한 fallback으로 표시됨
+
+### P2 — 플랫폼 검증과 출시
+
+- `UIHostingConfiguration` collection/table sample
+- `UIHostingController` 일반 화면 sample
+- 셀 재사용, async 높이 갱신, 회전, Dynamic Type UI 테스트
+- VoiceOver/Keyboard/Contrast 접근성 audit
+- P0 demo harness에 collection/table, lifecycle, 접근성 UI test 추가
+- README 사용 예제, 지원 matrix, dependency license notice
+
+완료 조건: 아래 테스트와 CI 조건을 모두 충족한다.
+
+---
+
+## 8. 테스트와 CI
+
+### parser/보안 fixture
+
+- `\(...\)`, `\[...\]`, opt-in `$`, `$$`, escape, 빈/미완성 delimiter
+- `$5`, `$5 and $10`, 닫는 `$` 뒤 숫자, 인접 `$$`
+- Markdown 기호가 든 수식: `\(a * b\)`, `\(x_[i]\)`, link-like source
+- backtick 길이, tilde fence, indented code, HTML, link/image 내부 delimiter
+- byte-length-preserving mask와 다국어 수식 앞뒤 source range
+- 한글, 이모지, 결합 문자, RTL의 UTF-8 offset
+- protect/restore byte round-trip property/fuzz test
+- 과대 입력, 깊은 Markdown, 많은 노드, 복잡한 수식의 fallback
+
+### 비동기/cache 테스트
+
+- parse 전/후와 수식 block 사이의 stale generation 중단
+- out-of-order 완료가 최신 generation을 덮지 않음
+- stale generation 결과가 cache에 들어가지 않음
+- 10Hz 입력에서 최대 동시 실행이 `1`, 최신 대기가 `1`보다 늘지 않음
+- 입력 종료 후 정한 idle 시간 안에 outstanding task가 `0`이 됨
+- font, size, color, mode, scale별 cache key
+- cost/count limit과 memory warning 정리
+- MainActor에서 CPU parse/raster가 실행되지 않는지 signpost 검증
+
+### 렌더/UI 테스트
+
+- 대표 수식군 baseline과 clipping 허용 오차
+- light/dark, 모든 Dynamic Type, Bold Text, Increase Contrast
+- 한글/영문/이모지/RTL
+- VoiceOver 읽기 순서, link semantics, 복사 버튼, Full Keyboard Access
+- 시스템 선택/복사 결과
+- collection/table reuse, 비동기 높이 변경, 회전
+
+### CI 원칙
+
+- Foundation-only Core는 host에서 `swift build --target SwiftLatexCore`로 우선 검증한다.
+- host에서는 Core target만 build한다. Core를 포함한 전체 unit test는 iOS Simulator의
+  Swift Package scheme에서 실행한다.
+- UIKit lifecycle/UI test는 `Examples/SwiftLatexDemo/SwiftLatexDemo.xcodeproj`의
+  shared scheme/test plan으로 실행한다.
+- macOS host의 일반 `swift test`를 UIKit target 검증 근거로 사용하지 않는다.
+- P0에서 CI simulator 기기/OS와 실제 package/demo scheme 이름을 고정하고 해당
+  `xcodebuild test -destination ...` 명령을 README에 기록한다.
+- 최소 지원 toolchain/고정 의존성 조합과 현재 검증 toolchain/승인 의존성 조합을 분리한다.
+- 현재 toolchain job은 Swift 6 language mode와 complete concurrency를 함께 켠다.
+- Swift 6 mode가 없는 최소 toolchain job은 complete concurrency + warnings-as-errors로 분리한다.
+- Core line coverage 80%와 license/notice 검사를 gate로 둔다.
+
+P0가 scheme을 만든 뒤 현재 로컬 최소 runtime에서는 다음 형태를 실제 실행해 이름과 옵션을
+고정한다. 빌드 출력은 파일로 보내고 exit code로 판정한다.
+
+```bash
+swiftlatex_results_dir=$(mktemp -d /tmp/swiftlatex-results.XXXXXX)
+
+swiftlatex_package_status=0
+xcodebuild test \
+  -scheme SwiftLatex-Package \
+  -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=18.6' \
+  -resultBundlePath "$swiftlatex_results_dir/package.xcresult" \
+  SWIFT_VERSION=6 \
+  SWIFT_STRICT_CONCURRENCY=complete \
+  SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+  -enableCodeCoverage YES \
+  > /tmp/swiftlatex-package-tests.log 2>&1 || swiftlatex_package_status=$?
+
+swiftlatex_demo_status=0
+xcodebuild test \
+  -project Examples/SwiftLatexDemo/SwiftLatexDemo.xcodeproj \
+  -scheme SwiftLatexDemo \
+  -testPlan SwiftLatexDemo \
+  -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=18.6' \
+  -resultBundlePath "$swiftlatex_results_dir/demo.xcresult" \
+  SWIFT_VERSION=6 \
+  SWIFT_STRICT_CONCURRENCY=complete \
+  SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+  -enableCodeCoverage YES \
+  > /tmp/swiftlatex-demo-tests.log 2>&1 || swiftlatex_demo_status=$?
+
+swiftlatex_coverage_status=0
+xcrun xccov view --report --json \
+  "$swiftlatex_results_dir/package.xcresult" \
+  > "$swiftlatex_results_dir/package-coverage.json" || swiftlatex_coverage_status=$?
+xcrun simctl shutdown all
+test "$swiftlatex_package_status" -eq 0 \
+  && test "$swiftlatex_demo_status" -eq 0 \
+  && test "$swiftlatex_coverage_status" -eq 0
+```
+
+iOS 16 실행 검증은 호환 Xcode/runtime 또는 실기기 환경에서 같은 test plan으로 별도 수행한다.
+P1에서 coverage JSON의 `SwiftLatexCore` line coverage가 `0.80` 미만이면 nonzero로 종료하는
+검사 script를 함께 추가한다. `-enableCodeCoverage YES`만으로 합격 처리하지 않는다.
