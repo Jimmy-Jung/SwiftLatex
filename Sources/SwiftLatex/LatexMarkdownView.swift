@@ -1,0 +1,330 @@
+import SwiftUI
+import SwiftLatexCore
+
+/// v1 공개 API (DEVELOPMENT.md §2).
+///
+/// ```swift
+/// LatexMarkdownView(markdown: message, parsesDollarMath: false)
+///     .latexTheme(.default)
+/// ```
+public struct LatexMarkdownView: View {
+    private let markdown: String
+    private let parsesDollarMath: Bool
+
+    @StateObject private var model = LatexRenderModel()
+    @Environment(\.latexTheme) private var theme
+    @Environment(\.displayScale) private var displayScale
+    @Environment(\.colorScheme) private var colorScheme
+    @ScaledMetric(relativeTo: .body) private var mathPointSize: CGFloat = 17
+
+    public init(markdown: String, parsesDollarMath: Bool = false) {
+        self.markdown = markdown
+        self.parsesDollarMath = parsesDollarMath
+    }
+
+    public var body: some View {
+        content
+            .task(id: currentRequest) {
+                model.submit(currentRequest)
+            }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if let document = model.document {
+            VStack(alignment: .leading, spacing: 12) {
+                // identity는 렌더 시점의 위치 + content digest. 편집 사이 영속성은 약속하지 않는다.
+                ForEach(Array(document.blocks.enumerated()), id: \.offset) { _, block in
+                    LatexBlockView(block: block, images: model.mathImages)
+                }
+            }
+        } else {
+            // 최신 원문 fallback 즉시 표시 (§4).
+            Text(markdown)
+                .textSelection(.enabled)
+        }
+    }
+
+    private var currentRequest: LatexRenderModel.Request {
+        LatexRenderModel.Request(
+            markdown: markdown,
+            parsesDollarMath: parsesDollarMath,
+            pointSize: mathPointSize,
+            colorRGBA: resolvedTextColorRGBA,
+            displayScale: displayScale
+        )
+    }
+
+    private var resolvedTextColorRGBA: UInt32 {
+        let style: UIUserInterfaceStyle = colorScheme == .dark ? .dark : .light
+        return UIColor(theme.textColor)
+            .resolvedColor(with: UITraitCollection(userInterfaceStyle: style))
+            .rgbaValue
+    }
+}
+
+// MARK: - Blocks
+
+struct LatexBlockView: View {
+    let block: ParsedBlock
+    let images: [MathSegment: RenderedMath]
+    @Environment(\.latexTheme) private var theme
+
+    var body: some View {
+        switch block {
+        case .paragraph(let runs):
+            InlineRunsText(runs: runs, images: images)
+
+        case .heading(let level, let runs):
+            InlineRunsText(runs: runs, images: images)
+                .font(Self.headingFont(level: level))
+                .accessibilityAddTraits(.isHeader)
+
+        case .codeBlock(let language, let code):
+            CodeBlockView(language: language, code: code)
+
+        case .blockMath(let segment):
+            BlockMathView(segment: segment, rendered: images[segment])
+
+        case .blockQuote(let children):
+            HStack(alignment: .top, spacing: 8) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(theme.quoteBar)
+                    .frame(width: 4)
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(children.enumerated()), id: \.offset) { _, child in
+                        LatexBlockView(block: child, images: images)
+                    }
+                }
+            }
+
+        case .unorderedList(let items):
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("•")
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(item.enumerated()), id: \.offset) { _, child in
+                                LatexBlockView(block: child, images: images)
+                            }
+                        }
+                    }
+                }
+            }
+
+        case .orderedList(let start, let items):
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("\(start + index).")
+                            .monospacedDigit()
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(item.enumerated()), id: \.offset) { _, child in
+                                LatexBlockView(block: child, images: images)
+                            }
+                        }
+                    }
+                }
+            }
+
+        case .thematicBreak:
+            Divider()
+        }
+    }
+
+    private static func headingFont(level: Int) -> Font {
+        switch level {
+        case 1: return .title.weight(.bold)
+        case 2: return .title2.weight(.bold)
+        case 3: return .title3.weight(.semibold)
+        default: return .headline
+        }
+    }
+}
+
+// MARK: - Inline runs
+
+struct InlineRunsText: View {
+    let runs: [InlineRun]
+    let images: [MathSegment: RenderedMath]
+    @Environment(\.latexTheme) private var theme
+
+    var body: some View {
+        combinedText
+            .textSelection(.enabled)
+            .modifier(MathAccessibilityLabel(runs: runs))
+    }
+
+    private var combinedText: Text {
+        runs.reduce(Text(verbatim: "")) { partial, run in
+            partial + text(for: run)
+        }
+    }
+
+    private func text(for run: InlineRun) -> Text {
+        var text: Text
+        switch run.content {
+        case .text(let string):
+            text = Text(verbatim: string)
+
+        case .code(let code):
+            var attributed = AttributedString(code)
+            attributed.font = .body.monospaced()
+            attributed.backgroundColor = theme.inlineCodeBackground
+            text = Text(attributed)
+
+        case .math(let segment):
+            if let rendered = images[segment] {
+                // `-descent` baseline 보정 (DEVELOPMENT.md §5).
+                text = Text(Image(uiImage: rendered.image))
+                    .baselineOffset(-rendered.descent)
+            } else {
+                // 렌더 전/실패 시 원래 구분자를 포함한 source를 표시한다.
+                text = Text(verbatim: segment.source)
+            }
+
+        case .link(let label, let destination):
+            var attributed = AttributedString(label)
+            attributed.link = destination
+            // 대비 기준을 넘는 링크 색 + 밑줄(색 외 구분 수단).
+            attributed.foregroundColor = theme.linkColor
+            attributed.underlineStyle = .single
+            text = Text(attributed)
+
+        case .hardBreak:
+            text = Text(verbatim: "\n")
+
+        case .softBreak:
+            text = Text(verbatim: " ")
+        }
+        if run.bold { text = text.bold() }
+        if run.italic { text = text.italic() }
+        if run.strikethrough { text = text.strikethrough() }
+        return text
+    }
+}
+
+/// 수식이 든 문단의 접근성 표현: "수식: 원본 LaTeX"를 읽기 순서대로 제공한다.
+/// 링크가 있는 문단에는 label을 덮어쓰지 않는다 — 개별 link semantics를 없애지 않기 위함 (§5).
+private struct MathAccessibilityLabel: ViewModifier {
+    let runs: [InlineRun]
+
+    func body(content: Content) -> some View {
+        if hasMath && !hasLink {
+            content.accessibilityLabel(spokenText)
+        } else {
+            content
+        }
+    }
+
+    private var hasMath: Bool {
+        runs.contains { if case .math = $0.content { return true } else { return false } }
+    }
+
+    private var hasLink: Bool {
+        runs.contains { if case .link = $0.content { return true } else { return false } }
+    }
+
+    private var spokenText: String {
+        runs.map { run in
+            switch run.content {
+            case .text(let string): return string
+            case .code(let code): return code
+            case .math(let segment): return "수식: \(segment.latex)"
+            case .link(let label, _): return label
+            case .hardBreak, .softBreak: return " "
+            }
+        }.joined()
+    }
+}
+
+// MARK: - Block math
+
+struct BlockMathView: View {
+    let segment: MathSegment
+    let rendered: RenderedMath?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                if let rendered {
+                    Image(uiImage: rendered.image)
+                        .accessibilityLabel("수식: \(segment.latex)")
+                } else {
+                    Text(verbatim: segment.source)
+                        .font(.body.monospaced())
+                        .textSelection(.enabled)
+                }
+            }
+            CopyButton(text: segment.source, accessibilityLabel: "수식 원문 복사")
+        }
+    }
+}
+
+// MARK: - Code block
+
+struct CodeBlockView: View {
+    let language: String?
+    let code: String
+    @Environment(\.latexTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 4) {
+                Text(language ?? "code")
+                    .font(.caption.monospaced())
+                    // secondary(60% 회색)를 밝은 헤더 배경에 쓰면 작은 텍스트 대비
+                    // 기준(4.5:1)에 미달해 접근성 audit이 실패한다. 테마 텍스트 색을 쓴다.
+                    .foregroundStyle(theme.textColor)
+                Spacer(minLength: 8)
+                CopyButton(text: code, accessibilityLabel: "코드 복사")
+            }
+            .padding(.horizontal, 12)
+            .background(theme.codeHeaderBackground)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(verbatim: code)
+                    .font(.body.monospaced())
+                    .textSelection(.enabled)
+                    .padding(12)
+            }
+            .background(theme.codeBlockBackground)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+// MARK: - Copy button
+
+struct CopyButton: View {
+    let text: String
+    let accessibilityLabel: String
+    @State private var copied = false
+
+    /// 복사 동작. 원래 구분자를 포함한 원문 source를 그대로 넣는다.
+    /// 러너 프로세스에서 pasteboard를 읽으면 권한 프롬프트가 뜨므로
+    /// 검증은 UI 테스트가 아니라 앱 프로세스 안의 unit test에서 한다.
+    @MainActor
+    static func copy(_ text: String, to pasteboard: UIPasteboard = .general) {
+        pasteboard.string = text
+    }
+
+    var body: some View {
+        Button {
+            Self.copy(text)
+            copied = true
+        } label: {
+            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                .imageScale(.small)
+                // 최소 44×44pt hit target (§5 접근성).
+                // 고정 크기다: 아이콘 교체로 폭이 바뀌면 가로 ScrollView가 재측정되고
+                // XCUITest의 "wait for app to idle"이 풀리지 않는다.
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
+        // ponytail: 체크 표시는 다시 누를 때까지 유지한다. 타이머 기반 자동 복귀는
+        // XCUITest의 "wait for app to idle"을 붙잡아 UI 테스트를 느리게 만든다.
+    }
+}
